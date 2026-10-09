@@ -1,0 +1,13 @@
+# quando il progetto è stabile lancia il comando 'pip freeze > requirements.txt'
+# per scrivere le versioni esatte 
+
+selenium            # controlla un browser reale (Chrome) per navigare Instagram e leggere i commenti
+webdriver-manager   # scarica in automatico il chromedriver giusto per la tua versione di Chrome
+pandas              # tabelle (DataFrame): salvare commenti, label e predizioni, leggere/scrivere CSV
+emoji               # converte le emoji in testo (demojize), per la variante "emoji tradotte"
+python-dotenv       # legge username e password dal file .env
+transformers        # scarica e usa i modelli di sentiment analysis da Hugging Face
+torch               # il motore che esegue i modelli (transformers ne ha bisogno)
+scikit-learn        # metriche di valutazione: accuracy, F1, matrice di confusione
+matplotlib          # grafici del confronto tra modelli
+ipykernel           # permette a VS Code di eseguire il notebook con questo ambiente

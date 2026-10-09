@@ -218,3 +218,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Add by me
+# Python environment
+venv/
+__pycache__/
+*.pyc
+
+# Private credentials and config
+credentials.txt
+.env
+
+# Scraped data / output (if you don't want to version them)
+data/
+output/
+*.csv
+
+# IDE
+.vscode/
+.idea/
+
+# Graphs
+.html
