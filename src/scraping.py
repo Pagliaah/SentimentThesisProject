@@ -21,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
 from selenium.webdriver import ActionChains
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -29,6 +29,13 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as ec
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+
+
+# ---------------------------------------------------------------------
+# FORMATTAZIONE
+# Stabilisce i caratteri che l'username può conten
+# ---------------------------------------------------------------------
+USERNAME_RE = re.compile(r"[A-Za-z0-9._]+")
 
 
 # ---------------------------------------------------------------------
@@ -63,6 +70,38 @@ COMMENT_BLOCK_CSS = ".x78zum5.xdt5ytf.x1iyjqo2"                      # contenito
 COMMENT_REPLY_XPATH = ".//*[text()='Rispondi' or text()='Reply']"    # tasto "Rispondi" (solo nei veri commenti)
 COMMENT_FIELDS_CSS = ".x1lliihq.x1plvlek.xryxfnj.x1n2onr6.xyejjpt"   # [0]=username, [1]=data, [2]=testo
 COMMENT_LIKES_CSS = ".x1lliihq.x193iq5w.x6ikm8r.x10wlt62.xlyipyv.xuxw1ft"  # numero di like del commento
+PAGE_REPLY_XPATH = "//*[text()='Rispondi' or text()='Reply']"    # come sopra, ma cerca in tutta la pagina
+
+
+# ---------------------------------------------------------------------
+# SCROLL DEI COMMENTI
+# Instagram carica i commenti a blocchi (circa 10 alla volta) mentre scorri
+# la sezione commenti: senza scroll se ne leggono solo i primi.
+# ---------------------------------------------------------------------
+MAX_SCROLL_ROUNDS = 60       # limite di sicurezza: massimo di scroll per ogni post
+STALL_ROUNDS = 3             # ci si ferma dopo tanti scroll di fila senza nuovi commenti
+SCROLL_PAUSE = (1.5, 2.5)    # attesa (secondi) dopo ogni scroll, per dare tempo di caricare
+ 
+# JavaScript eseguito nel browser. Riceve un elemento che sta dentro ai commenti
+# (arguments[0]) e risale i suoi genitori fino al primo che e' "scorrevole"
+# (overflow auto/scroll e contenuto piu' alto del box): quello e' il pannello dei
+# commenti, e lo porta in fondo. Non usa nomi di classe, quindi non si rompe quando
+# Instagram li cambia. Se non trova nessun pannello (finestra stretta: scorre
+# tutta la pagina) scorre la pagina intera.
+SCROLL_JS = """
+var node = arguments[0].parentElement;
+while (node) {
+    var overflowY = window.getComputedStyle(node).overflowY;
+    if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight) {
+        node.scrollTop = node.scrollHeight;
+        return node.scrollHeight;
+    }
+    node = node.parentElement;
+}
+window.scrollTo(0, document.body.scrollHeight);
+return document.body.scrollHeight;
+"""
+ 
 
 
 # Legge username e password dal file .env (nella cartella principale)
@@ -99,7 +138,7 @@ class InstagramScraper:
     # Pausa casuale tra due valori (in secondi). Le pause di durata variabile
     # simulano un utente umano e riducono il rischio che Instagram limiti
     # l'account (shadowban).
-    def _pausa(self, minimo=2, massimo=3):
+    def _pausa(self, minimo=1.5, massimo=3):
         time.sleep(random.uniform(minimo, massimo))
 
     # ----- Metodi di attesa -----
@@ -299,6 +338,43 @@ class InstagramScraper:
 
         return pd.DataFrame(rows, columns=["url_post", "username", "text", "likes"])
 
+    # Carica i commenti di un post scorrendo il pannello dei commenti.
+    # Ad ogni giro:
+    #   1. conta i commenti caricati (= quanti tasti "Rispondi" ci sono nella pagina);
+    #   2. si ferma se ne ha abbastanza (limit + 10 di margine, perche' alcuni
+    #      verranno scartati dai filtri) oppure se non e' comparso nulla di nuovo
+    #      per STALL_ROUNDS giri di fila (commenti finiti, o connessione lenta);
+    #   3. altrimenti scorre in fondo (SCROLL_JS) partendo dall'ultimo commento
+    #      e aspetta che Instagram carichi il blocco successivo.
+    # MAX_SCROLL_ROUNDS impedisce che il ciclo giri all'infinito.
+    # Restituisce il numero di commenti caricati.
+    def _scroll_comments(self, limit):
+        target = limit + 10
+        loaded = 0
+        previous = -1
+        stalled = 0
+ 
+        for _ in range(MAX_SCROLL_ROUNDS):
+            replies = self.browser.find_elements(By.XPATH, PAGE_REPLY_XPATH)
+            loaded = len(replies)
+ 
+            if loaded == 0 or loaded >= target:
+                break
+ 
+            stalled = stalled + 1 if loaded == previous else 0
+            if stalled >= STALL_ROUNDS:
+                break
+            previous = loaded
+ 
+            try:
+                self.browser.execute_script(SCROLL_JS, replies[-1])
+            except StaleElementReferenceException:
+                pass    # la pagina si e' aggiornata proprio ora: si riprova al giro dopo
+            self._pausa(*SCROLL_PAUSE)
+ 
+        print(f"Commenti caricati nella pagina: {loaded}")
+        return loaded
+
     # Apre UN post e ne estrae i commenti, restituendo una lista di dizionari
     # {url_post, username, text, likes}. Per ogni blocco "commento" della pagina:
     #   1. se non contiene il tasto "Rispondi" non e' un commento: si salta;
@@ -317,6 +393,7 @@ class InstagramScraper:
     def _scrape_single_post_comment(self, url, limit, post_owner):
         self.browser.get(url)
         self._pausa()    # un utente vero guarda il post prima di scorrere
+        self._scroll_comments(limit)    # carica altri commenti oltre ai primi
 
         results = []
         seen = set()     # coppie (username, testo) gia' viste in questo post
@@ -342,7 +419,7 @@ class InstagramScraper:
                         continue
                     if (user, text) in seen:
                         continue
-                    if " " in user:
+                    if not USERNAME_RE.fullmatch(user):    # scarta collaborazioni ("a\ne\nb") e campi sbagliati
                         continue
                     if post_owner and post_owner in user and post_owner in text:
                         continue
@@ -377,7 +454,7 @@ class InstagramScraper:
 # chiuso anche se qualcosa va storto a meta'.
 def main():
     parser = argparse.ArgumentParser(description="Scraping dei commenti di un profilo Instagram")
-    parser.add_argument("profile", help="username del profilo (senza @)")
+    parser.add_argument("profile", default="uniurbit", help="username del profilo (senza @) (default uniurbit)")
     parser.add_argument("--posts", type=int, default=10, help="quanti post leggere (default 10)")
     parser.add_argument("--comments", type=int, default=50, help="max commenti per post (default 50)")
     args = parser.parse_args()
