@@ -6,8 +6,10 @@ webdriver-manager   # scarica in automatico il chromedriver giusto per la tua ve
 pandas              # tabelle (DataFrame): salvare commenti, label e predizioni, leggere/scrivere CSV
 emoji               # converte le emoji in testo (demojize), per la variante "emoji tradotte"
 python-dotenv       # legge username e password dal file .env
-transformers        # scarica e usa i modelli di sentiment analysis da Hugging Face
+transformers<5      # scarica e usa i modelli di sentiment analysis da Hugging Face
 torch               # il motore che esegue i modelli (transformers ne ha bisogno)
 scikit-learn        # metriche di valutazione: accuracy, F1, matrice di confusione
 matplotlib          # grafici del confronto tra modelli
 ipykernel           # permette a VS Code di eseguire il notebook con questo ambiente
+sentencepiece       # traduce frasi e parole in pezzi o token per l'ai
+protobuf            # serve a salvare e inviare i dati

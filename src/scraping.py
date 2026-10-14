@@ -2,15 +2,18 @@
 # scraping.py - raccolta dei commenti Instagram per la tesi
 #
 # Flusso (nello stesso ordine in cui sono scritti i metodi qui sotto):
-#   1. si apre Chrome        ->  2. login con le credenziali del .env
+#   1. si apre Chrome
+#   2. login (cookie salvati, o credenziali del .env)
 #   3. lista dei post di un profilo (url, like, n. commenti, caption)
-#   4. commenti di ogni post ->  5. salvataggio in data/raw/*.csv
+#   4. commenti di ogni post
+#   5. salvataggio in data/raw/*.csv
 #
 # Uso (dalla cartella principale del progetto, con il venv attivo):
 #   python src/scraping.py NOME_PROFILO --posts 10 --comments 50
 # =====================================================================
 
 import argparse
+import json
 import math
 import os
 import random
@@ -21,7 +24,8 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import (NoSuchElementException, StaleElementReferenceException,
+                                        TimeoutException, WebDriverException)
 from selenium.webdriver import ActionChains
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -32,19 +36,15 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 # ---------------------------------------------------------------------
-# FORMATTAZIONE
-# Stabilisce i caratteri che l'username può conten
-# ---------------------------------------------------------------------
-USERNAME_RE = re.compile(r"[A-Za-z0-9._]+")
-
-
-# ---------------------------------------------------------------------
 # PERCORSHI
 # Calcolati a partire da dove si trova questo file, cosi' funzionano
 # anche se lanci lo script da un'altra cartella.
 # ---------------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT_DIR / "data" / "raw"
+# Cookie della sessione Instagram. ATTENZIONE: chi li ha entra nell'account senza password,
+# quindi questo file non deve MAI finire su GitHub (la cartella data/ e' ignorata da git).
+SESSION_FILE = ROOT_DIR / "data" / "session" / "instagram_cookies.json"
 
 
 # ---------------------------------------------------------------------
@@ -57,6 +57,9 @@ RAW_DIR = ROOT_DIR / "data" / "raw"
 COOKIE_XPATH = ("//button[text()='Consenti tutti i cookie' or text()='Consenti cookie facoltativi' "
                 "or text()='Accetta tutto' or text()='Allow all cookies']")
 LOGIN_BUTTON_XPATH = "//button[text()='Accedi' or text()='accedi']"
+# Pagina che richiede il login: se la sessione non e' valida Instagram reindirizza a /accounts/login/
+SESSION_CHECK_URL = "https://www.instagram.com/accounts/edit/"
+LOGIN_URL_PART = "accounts/login"
 USERNAME_FIELD_NAME = "email"      # attributo name del campo username nella pagina di login
 PASSWORD_FIELD_NAME = "pass"       # attributo name del campo password
 LOGIN_OK_XPATH = ("//div[contains(text(), 'Salva le informazioni')] "
@@ -72,6 +75,9 @@ COMMENT_FIELDS_CSS = ".x1lliihq.x1plvlek.xryxfnj.x1n2onr6.xyejjpt"   # [0]=usern
 COMMENT_LIKES_CSS = ".x1lliihq.x193iq5w.x6ikm8r.x10wlt62.xlyipyv.xuxw1ft"  # numero di like del commento
 PAGE_REPLY_XPATH = "//*[text()='Rispondi' or text()='Reply']"    # come sopra, ma cerca in tutta la pagina
 
+# Un username Instagram puo' contenere solo lettere, numeri, punti e underscore.
+# Serve a scartare i falsi "commenti" (es. "profilo_1\ne\nprofilo_2" nei post in collaborazione).
+USERNAME_RE = re.compile(r"[A-Za-z0-9._]+")
 
 # ---------------------------------------------------------------------
 # SCROLL DEI COMMENTI
@@ -81,7 +87,7 @@ PAGE_REPLY_XPATH = "//*[text()='Rispondi' or text()='Reply']"    # come sopra, m
 MAX_SCROLL_ROUNDS = 60       # limite di sicurezza: massimo di scroll per ogni post
 STALL_ROUNDS = 3             # ci si ferma dopo tanti scroll di fila senza nuovi commenti
 SCROLL_PAUSE = (1.5, 2.5)    # attesa (secondi) dopo ogni scroll, per dare tempo di caricare
- 
+
 # JavaScript eseguito nel browser. Riceve un elemento che sta dentro ai commenti
 # (arguments[0]) e risale i suoi genitori fino al primo che e' "scorrevole"
 # (overflow auto/scroll e contenuto piu' alto del box): quello e' il pannello dei
@@ -101,7 +107,6 @@ while (node) {
 window.scrollTo(0, document.body.scrollHeight);
 return document.body.scrollHeight;
 """
- 
 
 
 # Legge username e password dal file .env (nella cartella principale)
@@ -138,7 +143,7 @@ class InstagramScraper:
     # Pausa casuale tra due valori (in secondi). Le pause di durata variabile
     # simulano un utente umano e riducono il rischio che Instagram limiti
     # l'account (shadowban).
-    def _pausa(self, minimo=1.5, massimo=3):
+    def _pausa(self, minimo=2, massimo=3):
         time.sleep(random.uniform(minimo, massimo))
 
     # ----- Metodi di attesa -----
@@ -159,17 +164,82 @@ class InstagramScraper:
     def wait_for_click(self, by, value):
         return WebDriverWait(self.browser, 10).until(ec.element_to_be_clickable((by, value)))
 
+    # ----- Sessione (cookie salvati) -----
+
+    # Salva su disco i cookie della sessione appena aperta (SESSION_FILE), cosi' alla
+    # prossima esecuzione si puo' rientrare senza rifare il login: troppi login in
+    # poco tempo fanno bloccare l'account da Instagram. file non versionato, leggibile 
+    # solo in locale.
+    def _save_session(self):
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSION_FILE.write_text(json.dumps(self.browser.get_cookies()), encoding="utf-8")
+        try:
+            os.chmod(SESSION_FILE, 0o600)
+        except OSError:
+            pass    # ad esempio su Windows: i permessi funzionano diversamente
+        print(f"Sessione salvata in {SESSION_FILE.relative_to(ROOT_DIR)}")
+
+    # Prova a rientrare in Instagram con i cookie salvati, senza login. Passi:
+    #   1. se il file non c'e' (o e' illeggibile) restituisce subito False;
+    #   2. apre Instagram (i cookie si possono aggiungere solo a un sito gia' aperto)
+    #      e li inserisce uno a uno, saltando quelli che il browser rifiuta;
+    #   3. verifica che la sessione sia ancora valida aprendo una pagina che richiede
+    #      il login (SESSION_CHECK_URL): se Instagram reindirizza a /accounts/login/,
+    #      oppure compare il campo username, la sessione e' scaduta.
+    # Restituisce True se la sessione e' valida. Altrimenti cancella i cookie caricati
+    # (per non disturbare il login normale) e restituisce False.
+    # Nota: quando la sessione e' valida il controllo attende fino a 6 secondi il
+    # reindirizzamento che non arriva: e' normale, succede una volta per esecuzione.
+    def _login_with_saved_session(self):
+        if not SESSION_FILE.exists():
+            return False
+        try:
+            cookies = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            print("File della sessione illeggibile: faccio un login normale.")
+            return False
+
+        self.browser.get(self.link)
+        added = 0
+        for cookie in cookies:
+            try:
+                self.browser.add_cookie(cookie)
+                added += 1
+            except WebDriverException:
+                pass
+        if added == 0:
+            return False
+
+        self.browser.get(SESSION_CHECK_URL)
+        try:
+            WebDriverWait(self.browser, 6).until(lambda d: LOGIN_URL_PART in d.current_url)
+            expired = True
+        except TimeoutException:
+            expired = bool(self.browser.find_elements(By.NAME, USERNAME_FIELD_NAME))
+
+        if expired:
+            print("Sessione salvata scaduta: faccio un login normale.")
+            self.browser.delete_all_cookies()
+            return False
+
+        print("Sessione ripresa dai cookie salvati: nessun login necessario.")
+        return True
+
     # ----- Login -----
 
-    # Esegue il login su Instagram. Passi:
+    # Entra in Instagram. Prima prova con i cookie salvati (_login_with_saved_session);
+    # se non ci sono o sono scaduti, esegue il login con username e password. Passi:
     #   1. apre la home e accetta i cookie (se compare il popup);
     #   2. clicca "Accedi" se la pagina di login non si e' aperta da sola;
     #   3. scrive username e password nei campi e preme Invio;
     #   4. attende fino a 20 secondi il popup "Salva le informazioni / Non ora",
-    #      che compare solo se il login e' riuscito.
-    # Restituisce True se il login sembra riuscito, False altrimenti (password
-    # errata, richiesta di verifica di sicurezza, connessione lenta...).
+    #      che compare solo se il login e' riuscito; a quel punto salva la sessione.
+    # Restituisce True se si e' dentro, False altrimenti (password errata, richiesta
+    # di verifica di sicurezza, connessione lenta...).
     def login(self, username, password):
+        if self._login_with_saved_session():
+            return True
+
         self.browser.get(self.link)
 
         try:
@@ -197,6 +267,7 @@ class InstagramScraper:
             WebDriverWait(self.browser, 20).until(
                 ec.presence_of_element_located((By.XPATH, LOGIN_OK_XPATH)))
             print("Login effettuato.")
+            self._save_session()
             return True
         except TimeoutException:
             print("Il popup 'Salva info' non e' comparso: login probabilmente fallito "
@@ -325,8 +396,7 @@ class InstagramScraper:
     # `max_per_post`: massimo di commenti PER OGNI post (oppure "all").
     # `post_owner`: username del proprietario del profilo; serve a scartare la
     # didascalia del post, che nella pagina ha gli stessi tag di un commento.
-    # Attenzione: legge solo i commenti di primo livello (non le risposte) e
-    # solo quelli che Instagram ha gia' caricato nella pagina del post.
+    # Attenzione: legge solo i commenti di primo livello (non le risposte).
     def get_comments(self, post_urls, max_per_post, post_owner):
         limit = float("inf") if max_per_post == "all" else max_per_post
         print(f"--- Estrazione commenti da {len(post_urls)} post (max {max_per_post} per post)...")
@@ -353,37 +423,38 @@ class InstagramScraper:
         loaded = 0
         previous = -1
         stalled = 0
- 
+
         for _ in range(MAX_SCROLL_ROUNDS):
             replies = self.browser.find_elements(By.XPATH, PAGE_REPLY_XPATH)
             loaded = len(replies)
- 
+
             if loaded == 0 or loaded >= target:
                 break
- 
+
             stalled = stalled + 1 if loaded == previous else 0
             if stalled >= STALL_ROUNDS:
                 break
             previous = loaded
- 
+
             try:
                 self.browser.execute_script(SCROLL_JS, replies[-1])
             except StaleElementReferenceException:
                 pass    # la pagina si e' aggiornata proprio ora: si riprova al giro dopo
             self._pausa(*SCROLL_PAUSE)
- 
+
         print(f"Commenti caricati nella pagina: {loaded}")
         return loaded
 
-    # Apre UN post e ne estrae i commenti, restituendo una lista di dizionari
-    # {url_post, username, text, likes}. Per ogni blocco "commento" della pagina:
+    # Apre UN post, carica altri commenti con lo scroll (_scroll_comments) e li estrae,
+    # restituendo una lista di dizionari {url_post, username, text, likes}.
+    # Per ogni blocco "commento" della pagina:
     #   1. se non contiene il tasto "Rispondi" non e' un commento: si salta;
     #   2. si leggono username (campo 0) e testo (campo 2; il campo 1 e' la data,
     #      non usata);
     #   3. si scartano i casi anomali:
     #        - testo vuoto o uguale all'username (errore di lettura);
     #        - commento gia' visto nello stesso post (stesso utente e stesso testo);
-    #        - username con spazi: e' un post in collaborazione ("profilo_1 e altri 2");
+    #        - username non valido (a capo, spazi): post in collaborazione ("profilo_1 e profilo_2");
     #        - la didascalia del proprietario del post;
     #   4. si legge il numero di like del commento con una regex (prende il
     #      primo numero del testo, 0 se non c'e');
@@ -419,7 +490,7 @@ class InstagramScraper:
                         continue
                     if (user, text) in seen:
                         continue
-                    if not USERNAME_RE.fullmatch(user):    # scarta collaborazioni ("a\ne\nb") e campi sbagliati
+                    if not USERNAME_RE.fullmatch(user):    # collaborazioni ("a\ne\nb") e campi sbagliati
                         continue
                     if post_owner and post_owner in user and post_owner in text:
                         continue
@@ -454,10 +525,16 @@ class InstagramScraper:
 # chiuso anche se qualcosa va storto a meta'.
 def main():
     parser = argparse.ArgumentParser(description="Scraping dei commenti di un profilo Instagram")
-    parser.add_argument("profile", default="uniurbit", help="username del profilo (senza @) (default uniurbit)")
+    parser.add_argument("profile", help="username del profilo (senza @)")
     parser.add_argument("--posts", type=int, default=10, help="quanti post leggere (default 10)")
     parser.add_argument("--comments", type=int, default=50, help="max commenti per post (default 50)")
+    parser.add_argument("--reset-session", action="store_true",
+                        help="cancella i cookie salvati e rifa' il login con username e password")
     args = parser.parse_args()
+
+    if args.reset_session and SESSION_FILE.exists():
+        SESSION_FILE.unlink()
+        print("Sessione salvata cancellata.")
 
     user, password = get_credentials()
     RAW_DIR.mkdir(parents=True, exist_ok=True)
