@@ -96,9 +96,11 @@ class HFSentimentModel(SentimentModel):
     # nome Hugging Face (nel vecchio progetto il tokenizer era sbagliato).
     # Poi costruisce la lista _labels: per ogni indice di output del modello,
     # l'etichetta del progetto corrispondente. Se il modello usa nomi
-    # generici (LABEL_0, LABEL_1...) assume l'ordine negativo, neutro,
-    # positivo; se trova un nome sconosciuto si ferma con un errore chiaro
-    # invece di etichettare male in silenzio.
+    # generici (LABEL_0, LABEL_1...) assume l'ordine standard, che dipende
+    # dal numero di classi: 2 classi = negativo, positivo; 3 classi =
+    # negativo, neutro, positivo. Se trova un nome sconosciuto (o un numero
+    # di classi diverso) si ferma con un errore chiaro invece di etichettare
+    # male in silenzio.
     def _load(self) -> None:
         if self.model is not None:
             return
@@ -110,13 +112,17 @@ class HFSentimentModel(SentimentModel):
         self.model.to(self.device)
         self.model.eval()  # niente dropout: predizioni deterministiche
 
-        generic_order = ["negativo", "neutro", "positivo"]
+        generic_orders = {
+            2: ["negativo", "positivo"],
+            3: ["negativo", "neutro", "positivo"],
+        }
+        generic_order = generic_orders.get(self.model.config.num_labels, [])
         self._labels = []
         for i in range(self.model.config.num_labels):
             raw = str(self.model.config.id2label[i]).lower()
             if raw in self.label_map:
                 self._labels.append(self.label_map[raw])
-            elif raw.startswith("label_"):
+            elif raw.startswith("label_") and i < len(generic_order):
                 self._labels.append(generic_order[i])
             else:
                 raise ValueError(
