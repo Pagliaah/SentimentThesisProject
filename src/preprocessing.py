@@ -28,7 +28,7 @@ import pandas as pd
 ROOT_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT_DIR / "data" / "raw"
 LABELED_DIR = ROOT_DIR / "data" / "labeled"
-TO_LABEL_FILE = LABELED_DIR / "da_etichettare.csv"
+TO_LABEL_FILE = LABELED_DIR / "etichettati_a_mano.csv"
 
 VALID_LABELS = {"positivo", "negativo", "neutro"}
 
@@ -193,7 +193,7 @@ def attach_labels(df, labeled_csv):
 
 
 # Punto di ingresso: viene eseguito solo con `python src/preprocessing.py`.
-# Prepara il dataset e crea data/labeled/da_etichettare.csv con il campione da
+# Prepara il dataset e crea data/labeled/etichettati_a_mano.csv con il campione da
 # etichettare. Se quel file esiste gia' NON lo tocca, cosi' non puoi perdere per
 # sbaglio le etichette scritte a mano. Il file e' salvato in UTF-8 con BOM, che
 # permette a Excel e Numbers di mostrare bene emoji e lettere accentate.

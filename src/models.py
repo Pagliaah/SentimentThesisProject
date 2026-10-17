@@ -327,7 +327,7 @@ def _smoke_test(models: list[SentimentModel], texts: list[str]) -> None:
 # Esegue i modelli scelti sul dataset vero, con le due versioni del testo, e salva le
 # predizioni in out_path (stesso risultato di run_all dal notebook). Passi:
 #   1. legge i commenti di data/raw/ e li prepara (prepare_comments);
-#   2. li unisce alle etichette di data/labeled/da_etichettare.csv (attach_labels):
+#   2. li unisce alle etichette di data/labeled/etichettati_a_mano.csv (attach_labels):
 #      si usano solo i commenti che hai etichettato, perche' sono gli unici valutabili;
 #   3. lancia run_all(), che salva il CSV dopo ogni modello.
 # Se mancano i CSV o le etichette sono incomplete si ferma con il messaggio di errore
