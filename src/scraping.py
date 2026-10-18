@@ -2,14 +2,13 @@
 # scraping.py - raccolta dei commenti Instagram per la tesi
 #
 # Flusso (nello stesso ordine in cui sono scritti i metodi qui sotto):
-#   1. si apre Chrome
-#   2. login (cookie salvati, o credenziali del .env)
+#   1. si apre Chrome        ->  2. login (cookie salvati, o credenziali del .env)
 #   3. lista dei post di un profilo (url, like, n. commenti, caption)
-#   4. commenti di ogni post
-#   5. salvataggio in data/raw/*.csv
+#   4. commenti di ogni post ->  5. salvataggio in data/raw/*.csv
 #
 # Uso (dalla cartella principale del progetto, con il venv attivo):
 #   python src/scraping.py NOME_PROFILO --posts 10 --comments 50
+# Dal notebook: from src import scraping; scraping.scrape_profile("NOME_PROFILO", 10, 50)
 # =====================================================================
 
 import argparse
@@ -168,8 +167,8 @@ class InstagramScraper:
 
     # Salva su disco i cookie della sessione appena aperta (SESSION_FILE), cosi' alla
     # prossima esecuzione si puo' rientrare senza rifare il login: troppi login in
-    # poco tempo fanno bloccare l'account da Instagram. file non versionato, leggibile 
-    # solo in locale.
+    # poco tempo fanno bloccare l'account da Instagram. Il file viene reso leggibile
+    # solo da te (permessi 600), perche' equivale alla password.
     def _save_session(self):
         SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         SESSION_FILE.write_text(json.dumps(self.browser.get_cookies()), encoding="utf-8")
@@ -518,21 +517,20 @@ class InstagramScraper:
         return results
 
 
-# Punto di ingresso: viene eseguito solo quando lanci direttamente
-# `python src/scraping.py ...`, non quando il file viene importato.
-# Legge i parametri dalla riga di comando, fa login, raccoglie post e commenti
-# e li salva in data/raw/. Il blocco try/finally garantisce che Chrome venga
-# chiuso anche se qualcosa va storto a meta'.
-def main():
-    parser = argparse.ArgumentParser(description="Scraping dei commenti di un profilo Instagram")
-    parser.add_argument("profile", help="username del profilo (senza @)")
-    parser.add_argument("--posts", type=int, default=10, help="quanti post leggere (default 10)")
-    parser.add_argument("--comments", type=int, default=50, help="max commenti per post (default 50)")
-    parser.add_argument("--reset-session", action="store_true",
-                        help="cancella i cookie salvati e rifa' il login con username e password")
-    args = parser.parse_args()
-
-    if args.reset_session and SESSION_FILE.exists():
+# Raccoglie post e commenti di un profilo e li salva in data/raw/ (posts_PROFILO.csv e
+# commenti_PROFILO.csv, sovrascrivendo quelli dello stesso profilo). Passi: legge le
+# credenziali dal file .env, apre Chrome, fa login (o riprende la sessione salvata),
+# legge i post, legge i commenti e chiude Chrome (anche se qualcosa va storto).
+# Ha la stessa funzione dalla riga di comando (main) e dal notebook.
+#
+# SICUREZZA: username e password vengono letti QUI DENTRO dal file .env e restano variabili
+# locali di questa funzione: non vengono mai stampati, restituiti o salvati, quindi chi la
+# chiama (anche un notebook) non li vede mai. Restituisce i due DataFrame (post, commenti):
+# i commenti contengono gli username VERI, quindi non mostrarli nel notebook.
+# Solleva RuntimeError (con un messaggio chiaro, senza dati segreti) se mancano le credenziali
+# o se il login non riesce.
+def scrape_profile(profile, n_posts=10, n_comments=50, reset_session=False):
+    if reset_session and SESSION_FILE.exists():
         SESSION_FILE.unlink()
         print("Sessione salvata cancellata.")
 
@@ -542,19 +540,39 @@ def main():
     bot = InstagramScraper()
     try:
         if not bot.login(user, password):
-            print("Interrotto: login non riuscito.")
-            return
+            raise RuntimeError("Interrotto: login non riuscito (controlla le credenziali nel "
+                               ".env o eventuali richieste di verifica sul telefono).")
 
-        posts = bot.get_metadata(args.profile, args.posts)
-        posts.to_csv(RAW_DIR / f"posts_{args.profile}.csv", index=False)
-        print(f"Salvati {len(posts)} post in data/raw/posts_{args.profile}.csv")
+        posts = bot.get_metadata(profile, n_posts)
+        posts.to_csv(RAW_DIR / f"posts_{profile}.csv", index=False)
+        print(f"Salvati {len(posts)} post in data/raw/posts_{profile}.csv")
 
         urls = [u for u in posts["url"] if u and u != "N/D"]
-        comments = bot.get_comments(urls, args.comments, args.profile)
-        comments.to_csv(RAW_DIR / f"commenti_{args.profile}.csv", index=False)
-        print(f"Salvati {len(comments)} commenti in data/raw/commenti_{args.profile}.csv")
+        comments = bot.get_comments(urls, n_comments, profile)
+        comments.to_csv(RAW_DIR / f"commenti_{profile}.csv", index=False)
+        print(f"Salvati {len(comments)} commenti in data/raw/commenti_{profile}.csv")
     finally:
         bot.close()
+
+    return posts, comments
+
+
+# Punto di ingresso: viene eseguito solo quando lanci direttamente
+# `python src/scraping.py ...`, non quando il file viene importato.
+# Legge i parametri dalla riga di comando e chiama scrape_profile.
+def main():
+    parser = argparse.ArgumentParser(description="Scraping dei commenti di un profilo Instagram")
+    parser.add_argument("profile", help="username del profilo (senza @)")
+    parser.add_argument("--posts", type=int, default=10, help="quanti post leggere (default 10)")
+    parser.add_argument("--comments", type=int, default=50, help="max commenti per post (default 50)")
+    parser.add_argument("--reset-session", action="store_true",
+                        help="cancella i cookie salvati e rifa' il login con username e password")
+    args = parser.parse_args()
+
+    try:
+        scrape_profile(args.profile, args.posts, args.comments, args.reset_session)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc))
 
 
 if __name__ == "__main__":
