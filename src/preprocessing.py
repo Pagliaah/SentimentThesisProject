@@ -6,10 +6,13 @@
 #   2. prepare_comments()     pulisce, toglie i doppioni, sostituisce gli username
 #                             con pseudonimi, crea le due versioni del testo
 #                             (emoji grezze / emoji tradotte in parole)
-#   3. sample_for_labeling()  estrae a caso i commenti da etichettare a mano
-#   4. attach_labels()        riunisce le tue etichette al dataset
+#   3. create_label_set()     estrae a caso i commenti da etichettare a mano e li
+#                             salva in un "set" numerato (etichettati_a_mano_00.csv,
+#                             _01.csv, ...): puoi crearne quanti ne vuoi, uno alla
+#                             volta, e i commenti non si ripetono mai da un set all'altro
+#   4. attach_labels()        riunisce le tue etichette (di uno o piu' set) al dataset
 #
-# Uso da terminale (crea il file da etichettare, senza sovrascrivere quello gia' fatto):
+# Uso da terminale (crea il PROSSIMO set, senza sovrascrivere quelli gia' fatti):
 #   python src/preprocessing.py --n 300
 # =====================================================================
 
@@ -28,7 +31,12 @@ import pandas as pd
 ROOT_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = ROOT_DIR / "data" / "raw"
 LABELED_DIR = ROOT_DIR / "data" / "labeled"
-TO_LABEL_FILE = LABELED_DIR / "etichettati_a_mano.csv"
+
+# I set di etichette si chiamano etichettati_a_mano_00.csv, etichettati_a_mano_01.csv...
+LABEL_SET_PREFIX = "etichettati_a_mano"
+SET_FILE_RE = re.compile(rf"^{LABEL_SET_PREFIX}_(\d+)\.csv$")
+# Nomi usati in passato per un unico file di etichette (prima dei set numerati).
+LEGACY_LABEL_FILES = (f"{LABEL_SET_PREFIX}.csv", "da_etichettare.csv")
 
 VALID_LABELS = {"positivo", "negativo", "neutro"}
 
@@ -150,13 +158,100 @@ def prepare_comments(raw):
     return df[columns].reset_index(drop=True), username_map
 
 
+# ---------------------------------------------------------------------
+# SET DI ETICHETTE
+# Ogni set e' un file data/labeled/etichettati_a_mano_NN.csv (NN = 00, 01, 02...) con tre
+# colonne: comment_id, text_clean, label_true. Si possono creare piu' set in momenti
+# diversi (per esempio 300 commenti oggi e altri 150 la settimana prossima): i commenti
+# di un set non compaiono mai in un altro, e per valutare i modelli si possono usare
+# tutti i set insieme o solo alcuni.
+# ---------------------------------------------------------------------
+
+# Percorso del file di un set: label_set_path(1) o label_set_path("01") ->
+# data/labeled/etichettati_a_mano_01.csv. Un numero non valido da' un errore chiaro.
+def label_set_path(number):
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{number}' non e' un numero di set valido (esempi: 00, 01, 02)")
+    return LABELED_DIR / f"{LABEL_SET_PREFIX}_{number:02d}.csv"
+
+
+# Elenca i set esistenti, in ordine di numero, come lista di coppie (numero, percorso),
+# per esempio [("00", Path(...)), ("01", Path(...))]. Lista vuota se non ce ne sono.
+def list_label_sets():
+    found = {}
+    for path in LABELED_DIR.glob(f"{LABEL_SET_PREFIX}_*.csv"):
+        match = SET_FILE_RE.match(path.name)
+        if match:
+            found[f"{int(match.group(1)):02d}"] = path
+    return sorted(found.items(), key=lambda item: int(item[0]))
+
+
+# Numero del prossimo set libero: 0 se non ce ne sono, altrimenti l'ultimo + 1.
+def next_set_number():
+    sets = list_label_sets()
+    return int(sets[-1][0]) + 1 if sets else 0
+
+
+# Trasforma i numeri di set scelti dall'utente (es. ["00", "02"]) nei percorsi dei file.
+# Senza numeri restituisce TUTTI i set esistenti. Se non c'e' nessun set, o ne viene
+# chiesto uno che non esiste, si ferma con un messaggio che dice cosa fare. Se trova un
+# vecchio file di etichette senza numero (etichettati_a_mano.csv / da_etichettare.csv)
+# suggerisce di rinominarlo come set 00.
+def resolve_label_sets(numbers=None):
+    available = list_label_sets()
+    if not available:
+        legacy = [name for name in LEGACY_LABEL_FILES if (LABELED_DIR / name).exists()]
+        hint = (f" Trovato {legacy[0]}: rinominalo in {label_set_path(0).name} per usarlo come set 00."
+                if legacy else "")
+        raise FileNotFoundError(f"Nessun set di etichette in {LABELED_DIR}. "
+                                f"Creane uno con: python src/preprocessing.py.{hint}")
+    if not numbers:
+        return [path for _, path in available]
+
+    by_number = dict(available)
+    chosen = []
+    for number in numbers:
+        key = f"{int(label_set_path(number).stem.rsplit('_', 1)[1]):02d}"
+        if key not in by_number:
+            raise FileNotFoundError(f"Il set {key} non esiste. Set disponibili: {', '.join(by_number)}")
+        if by_number[key] not in chosen:
+            chosen.append(by_number[key])
+    return chosen
+
+
+# Legge un file di etichette. Riconosce da solo il separatore e la codifica con o senza BOM. 
+# Tutto come testo.
+def _read_labels_csv(path):
+    return pd.read_csv(path, sep=None, engine="python", dtype=str, encoding="utf-8-sig")
+
+
+# Nome del set a cui appartiene un file ("00", "01"...); se il nome non segue lo schema
+# usa il nome del file senza estensione.
+def _set_name(path):
+    match = SET_FILE_RE.match(Path(path).name)
+    return f"{int(match.group(1)):02d}" if match else Path(path).stem
+
+
+# Identificativi di tutti i commenti gia' presenti in un set (etichettati o ancora da
+# etichettare): servono a non estrarli una seconda volta.
+def used_comment_ids():
+    ids = set()
+    for _, path in list_label_sets():
+        ids.update(_read_labels_csv(path)["comment_id"].dropna())
+    return ids
+
+
 # Estrae `n` commenti a caso da etichettare a mano e restituisce una tabella con tre
 # colonne: comment_id, text_clean (con le emoji vere, cosi' le leggi come le leggerebbe
 # una persona) e label_true, vuota. Il campionamento e' casuale ma ripetibile: con lo
-# stesso `seed` ottieni sempre lo stesso campione. Se i commenti sono meno di `n`
-# li prende tutti.
-def sample_for_labeling(df, n=300, seed=42):
-    sample = df.sample(n=min(n, len(df)), random_state=seed)
+# stesso `seed` e gli stessi dati ottieni sempre lo stesso campione. I commenti in
+# `exclude_ids` (quelli gia' in altri set) non vengono mai estratti. Se i commenti
+# disponibili sono meno di `n` li prende tutti.
+def sample_for_labeling(df, n=300, seed=42, exclude_ids=None):
+    pool = df if not exclude_ids else df[~df["comment_id"].isin(exclude_ids)]
+    sample = pool.sample(n=min(n, len(pool)), random_state=seed)
     return pd.DataFrame({
         "comment_id": sample["comment_id"].values,
         "text_clean": sample["text_clean"].values,
@@ -164,56 +259,111 @@ def sample_for_labeling(df, n=300, seed=42):
     })
 
 
-# Legge il file che hai etichettato a mano e lo riunisce al dataset, aggiungendo la
-# colonna label_true. Controlla che il lavoro a mano sia a posto: se qualche riga non
-# ha etichetta o ne ha una diversa da positivo/negativo/neutro, si ferma e ti dice
-# quali righe correggere (numerate come le vedi nel foglio di calcolo, intestazione =
-# riga 1). Legge sia CSV con la virgola sia con il punto e virgola (Excel italiano) e
-# ignora maiuscole e spazi. Restituisce solo i commenti etichettati.
+# Crea un nuovo set da etichettare e lo salva in data/labeled/. `number` e' il numero
+# del set (es. 3 oppure "03"); se omesso usa il primo libero (00, poi 01...). Estrae
+# `n` commenti a caso tra quelli che NON sono gia' in un altro set. Non sovrascrive
+# mai: se il file esiste solleva FileExistsError; se non resta nessun commento libero
+# solleva ValueError (serve altro scraping). Restituisce (percorso, campione).
+# Il file e' salvato in UTF-8 con BOM, che permette a Excel e Numbers di mostrare bene
+# emoji e lettere accentate.
+def create_label_set(dataset, n=300, seed=42, number=None):
+    number = next_set_number() if number is None else number
+    path = label_set_path(number)
+    if path.exists():
+        raise FileExistsError(f"{path.name} esiste gia': non lo sovrascrivo.")
+
+    sample = sample_for_labeling(dataset, n, seed, exclude_ids=used_comment_ids())
+    if sample.empty:
+        raise ValueError("Tutti i commenti sono gia' in un set di etichette: serve altro scraping.")
+
+    LABELED_DIR.mkdir(parents=True, exist_ok=True)
+    sample.to_csv(path, index=False, encoding="utf-8-sig")
+    return path, sample
+
+
+# Legge le etichette che hai scritto a mano e le riunisce al dataset, aggiungendo le
+# colonne label_true e set (il numero del set di provenienza). `labeled_csv` puo' essere
+# un solo file o una lista di file (vedi resolve_label_sets). Controlla che il lavoro a
+# mano sia a posto: se qualche riga non ha etichetta o ne ha una diversa da
+# positivo/negativo/neutro, si ferma e dice in quale file e a quali righe (numerate come
+# le vedi nel foglio di calcolo, intestazione = riga 1). Si ferma anche se uno stesso
+# commento compare in piu' righe o in piu' set. Ignora maiuscole e spazi. Restituisce
+# solo i commenti etichettati.
 def attach_labels(df, labeled_csv):
-    labels = pd.read_csv(labeled_csv, sep=None, engine="python", dtype=str, encoding="utf-8-sig")
-    labels["label_true"] = labels["label_true"].str.strip().str.lower()
+    paths = list(labeled_csv) if isinstance(labeled_csv, (list, tuple)) else [labeled_csv]
+
+    frames = []
+    for path in paths:
+        part = _read_labels_csv(path)
+        missing_columns = {"comment_id", "label_true"} - set(part.columns)
+        if missing_columns:
+            raise ValueError(f"{Path(path).name}: mancano le colonne {sorted(missing_columns)}")
+        part["label_true"] = part["label_true"].str.strip().str.lower()
+        part["set"] = _set_name(path)
+        part["file"] = Path(path).name
+        part["riga"] = part.index + 2
+        frames.append(part)
+    labels = pd.concat(frames, ignore_index=True)
 
     missing = labels["label_true"].isna() | (labels["label_true"] == "")
     invalid = ~missing & ~labels["label_true"].isin(VALID_LABELS)
-    if missing.any() or invalid.any():
-        parts = []
-        if missing.any():
-            parts.append(f"senza etichetta: righe {list((labels.index[missing] + 2))}")
-        if invalid.any():
-            parts.append(f"etichetta non valida: righe {list((labels.index[invalid] + 2))} "
-                         f"(valide: {', '.join(sorted(VALID_LABELS))})")
-        raise ValueError("Etichette da correggere -> " + "; ".join(parts))
+    problems = []
+    for name in labels["file"].unique():
+        in_file = labels["file"] == name
+        if (missing & in_file).any():
+            problems.append(f"{name}: senza etichetta alle righe {labels.loc[missing & in_file, 'riga'].tolist()}")
+        if (invalid & in_file).any():
+            problems.append(f"{name}: etichetta non valida alle righe "
+                            f"{labels.loc[invalid & in_file, 'riga'].tolist()} "
+                            f"(valide: {', '.join(sorted(VALID_LABELS))})")
+    if problems:
+        raise ValueError("Etichette da correggere -> " + "; ".join(problems))
 
-    merged = df.merge(labels[["comment_id", "label_true"]], on="comment_id", how="inner")
+    repeated = labels["comment_id"].duplicated(keep=False)
+    if repeated.any():
+        sets = ", ".join(sorted(labels.loc[repeated, "set"].unique()))
+        raise ValueError(f"{labels.loc[repeated, 'comment_id'].nunique()} commenti compaiono piu' volte "
+                         f"nei set di etichette ({sets}): ogni commento deve stare in un solo set.")
+
+    merged = df.merge(labels[["comment_id", "label_true", "set"]], on="comment_id", how="inner")
     if len(merged) < len(labels):
         print(f"Attenzione: {len(labels) - len(merged)} commenti etichettati non sono nel dataset "
               f"(scraping rifatto con dati diversi?)")
     return merged
 
 
-# Punto di ingresso: viene eseguito solo con `python src/preprocessing.py`.
-# Prepara il dataset e crea data/labeled/etichettati_a_mano.csv con il campione da
-# etichettare. Se quel file esiste gia' NON lo tocca, cosi' non puoi perdere per
-# sbaglio le etichette scritte a mano. Il file e' salvato in UTF-8 con BOM, che
-# permette a Excel e Numbers di mostrare bene emoji e lettere accentate.
+# Punto di ingresso: viene eseguito solo con `python src/preprocessing.py ...`.
+# Prepara il dataset e crea un NUOVO set da etichettare in data/labeled/
+# (etichettati_a_mano_NN.csv): per default il primo numero libero, oppure quello
+# indicato con --set. I commenti estratti sono diversi da quelli degli altri set.
+# Non sovrascrive mai un set esistente, cosi' non puoi perdere le etichette scritte
+# a mano.
 def main():
-    parser = argparse.ArgumentParser(description="Prepara il campione di commenti da etichettare")
+    parser = argparse.ArgumentParser(description="Crea un set di commenti da etichettare a mano")
     parser.add_argument("--n", type=int, default=300, help="quanti commenti estrarre (default 300)")
     parser.add_argument("--seed", type=int, default=42, help="seme del campionamento casuale")
+    parser.add_argument("--set", dest="set_number", default=None, metavar="NN",
+                        help="numero del set da creare (es. 03); se omesso, il primo libero")
     args = parser.parse_args()
 
     dataset, _ = prepare_comments(load_raw_comments())
     print(f"Commenti pronti: {len(dataset)} (di cui solo emoji: {int(dataset['emoji_only'].sum())})")
 
-    if TO_LABEL_FILE.exists():
-        print(f"{TO_LABEL_FILE.name} esiste gia': non lo sovrascrivo.")
-        return
+    existing = [number for number, _ in list_label_sets()]
+    if existing:
+        print(f"Set di etichette gia' presenti: {', '.join(existing)}")
 
-    LABELED_DIR.mkdir(parents=True, exist_ok=True)
-    sample = sample_for_labeling(dataset, args.n, args.seed)
-    sample.to_csv(TO_LABEL_FILE, index=False, encoding="utf-8-sig")
-    print(f"Creato {TO_LABEL_FILE} con {len(sample)} commenti: compila la colonna label_true "
+    try:
+        path, sample = create_label_set(dataset, args.n, args.seed, args.set_number)
+    except FileExistsError as exc:
+        print(exc)
+        return
+    except ValueError as exc:
+        raise SystemExit(str(exc))
+
+    if len(sample) < args.n:
+        print(f"Attenzione: restavano solo {len(sample)} commenti non ancora in un set.")
+    print(f"Creato {path} con {len(sample)} commenti: compila la colonna label_true "
           f"(positivo / negativo / neutro).")
 
 
