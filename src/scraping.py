@@ -2,9 +2,11 @@
 # scraping.py - raccolta dei commenti Instagram per la tesi
 #
 # Flusso (nello stesso ordine in cui sono scritti i metodi qui sotto):
-#   1. si apre Chrome        ->  2. login (cookie salvati, o credenziali del .env)
+#   1. si apre Chrome
+#   2. login (cookie salvati, o credenziali del .env)
 #   3. lista dei post di un profilo (url, like, n. commenti, caption)
-#   4. commenti di ogni post ->  5. salvataggio in data/raw/*.csv
+#   4. commenti di ogni post
+#   5. salvataggio in data/raw/*.csv
 #
 # Uso (dalla cartella principale del progetto, con il venv attivo):
 #   python src/scraping.py NOME_PROFILO --posts 10 --comments 50
@@ -167,8 +169,8 @@ class InstagramScraper:
 
     # Salva su disco i cookie della sessione appena aperta (SESSION_FILE), cosi' alla
     # prossima esecuzione si puo' rientrare senza rifare il login: troppi login in
-    # poco tempo fanno bloccare l'account da Instagram. Il file viene reso leggibile
-    # solo da te (permessi 600), perche' equivale alla password.
+    # poco tempo fanno bloccare l'account da Instagram. file non versionato, leggibile 
+    # solo in locale.
     def _save_session(self):
         SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
         SESSION_FILE.write_text(json.dumps(self.browser.get_cookies()), encoding="utf-8")

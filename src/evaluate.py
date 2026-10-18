@@ -12,12 +12,16 @@
 #   2. le matrici di confusione;
 #   3. i test di McNemar: la traduzione delle emoji cambia davvero i risultati di
 #      un modello? un modello e' davvero migliore di un altro?
-#   4. esempi di commenti sbagliati, per l'analisi degli errori.
+#   4. esempi di commenti sbagliati, per l'analisi degli errori;
+#   5. una tabella commento per commento, con testo, tua etichetta e risposta di ogni
+#      modello: le predizioni salvate da models.py sono solo codici (comment_id) ed
+#      etichette, questa tabella le rende leggibili.
 #
 # Tutte le funzioni lavorano su DataFrame, quindi si possono usare anche dal
 # notebook. Da terminale (dalla cartella principale del progetto, con il venv attivo):
-#     python src/evaluate.py                  stampa tutte le tabelle
-#     python src/evaluate.py --errors 5       aggiunge 5 commenti sbagliati per modello e versione
+#     python src/evaluate.py                  stampa tutte le tabelle (con i colori)
+#     python src/evaluate.py --errors 5       stampa SOLO 5 commenti sbagliati per modello e versione
+#     python src/evaluate.py --sets 00 01     usa solo i set di etichette 00 e 01 (default: tutti)
 #     python src/evaluate.py --save           salva anche CSV e grafici in data/results/
 # Tutte le opzioni: python src/evaluate.py --help
 # =====================================================================
@@ -25,6 +29,9 @@
 from __future__ import annotations
 
 import argparse
+import os
+import re
+import sys
 from itertools import combinations
 from pathlib import Path
 
@@ -47,22 +54,26 @@ LABELS = ("positivo", "negativo", "neutro")
 VERSION_CLEAN = "text_clean"
 VERSION_EMOJI = "text_emoji"
 
+# Nomi leggibili delle versioni, usati nelle intestazioni della tabella commento per commento.
+VERSION_NAMES = {VERSION_CLEAN: "emoji grezze", VERSION_EMOJI: "emoji tradotte"}
+
 # Sotto questa soglia di commenti le percentuali oscillano molto: la tabella lo segnala.
 MIN_RELIABLE = 30
 
 
 # Costruisce il dataset etichettato partendo dai file del progetto: legge i commenti di
 # data/raw/, li prepara (prepare_comments) e ci unisce le tue etichette (attach_labels).
-# `labels_csv` e' il file compilato a mano; se omesso usa data/labeled/etichettati_a_mano.csv.
-# Serve a chi lancia lo script da terminale: dal notebook di solito il dataset c'e' gia'.
-def load_labeled_dataset(labels_csv=None):
+# `sets` sono i numeri dei set di etichette da usare (es. ["00", "01"]); se omesso, TUTTI
+# i set di data/labeled/. Serve a chi lancia lo script da terminale: dal notebook di solito
+# il dataset c'e' gia'.
+def load_labeled_dataset(sets=None):
     try:
         import preprocessing as pp            # lanciato come: python src/evaluate.py
     except ImportError:
         from src import preprocessing as pp   # importato come modulo (es. dal notebook)
 
     dataset, _ = pp.prepare_comments(pp.load_raw_comments())
-    return pp.attach_labels(dataset, labels_csv or pp.TO_LABEL_FILE)
+    return pp.attach_labels(dataset, pp.resolve_label_sets(sets))
 
 
 # Legge il CSV delle predizioni creato da models.py (colonne comment_id, model, version,
@@ -96,7 +107,7 @@ def merge_predictions(labeled, predictions):
     if missing:
         raise ValueError(f"Nel dataset etichettato mancano le colonne: {missing}")
 
-    optional = [c for c in ("emoji_only", "user") if c in labeled.columns]
+    optional = [c for c in ("emoji_only", "user", "set") if c in labeled.columns]
     merged = predictions.merge(labeled[needed + optional], on="comment_id", how="inner")
 
     dropped = len(predictions) - len(merged)
@@ -280,6 +291,45 @@ def error_examples(merged, model, version, n=10, seed=42):
     return wrong.sample(n=min(n, len(wrong)), random_state=seed)[columns].reset_index(drop=True)
 
 
+# Rimette insieme i codici: una riga per commento, con il testo, la TUA etichetta e la
+# risposta di ogni modello su ogni versione del testo. E' la tabella da leggere "a occhio",
+# come un foglio di lavoro. Colonne:
+#   comment_id, utente (pseudonimo), set (di etichette di provenienza), commento (testo
+#   con le emoji vere),
+#   emoji tradotte (il testo tradotto, vuoto se uguale al commento: cioe' senza emoji),
+#   tua etichetta, una colonna per ogni coppia modello/versione (es. "feel_it [emoji grezze]"),
+#   giuste / totali (quante predizioni su quante sono giuste per quel commento).
+# Con hardest_first=True i commenti sono ordinati dai piu' difficili (meno predizioni
+# giuste) ai piu' facili. Contiene il testo dei commenti: se la salvi su file, tienila
+# in data/ (ignorata da git).
+def readable_predictions(merged, hardest_first=True):
+    unique = merged.drop_duplicates(["comment_id", "model", "version"])
+    base = unique.drop_duplicates("comment_id").set_index("comment_id")
+
+    out = pd.DataFrame({
+        "commento": base["text_clean"],
+        "emoji tradotte": base["text_emoji"].where(base["text_emoji"] != base["text_clean"], ""),
+        "tua etichetta": base["label_true"],
+    })
+    if "set" in base.columns:
+        out.insert(0, "set", base["set"])
+    if "user" in base.columns:
+        out.insert(0, "utente", base["user"])
+
+    order = list(dict.fromkeys(zip(unique["model"], unique["version"])))
+    wide = unique.pivot(index="comment_id", columns=["model", "version"], values="label_pred")[order]
+    wide.columns = [f"{model} [{VERSION_NAMES.get(version, version)}]" for model, version in order]
+
+    score = unique.groupby("comment_id")["correct"].agg(giuste="sum", totali="count")
+    out = out.join(wide).join(score).sort_index()
+    out["giuste"] = out["giuste"].astype(int)
+    out["totali"] = out["totali"].astype(int)
+
+    if hardest_first:
+        out = out.sort_values("giuste", kind="mergesort")      # stabile: a parita' resta l'ordine per id
+    return out.reset_index()
+
+
 # Grafico a barre di una metrica (default macro_f1): un gruppo per modello, una barra per
 # versione del testo. Riceve la tabella di compute_metrics() per UN solo sottoinsieme
 # (es. metrics[metrics["subset"] == "tutti"]). Restituisce la figura matplotlib: dal
@@ -337,6 +387,7 @@ def plot_confusions(matrices, ncols=4):
 #   confusions  matrici di confusione
 #   versions    McNemar: emoji grezze contro emoji tradotte, per ogni modello
 #   models      McNemar: modelli a confronto, per ogni versione del testo
+#   readable    tabella commento per commento (vedi readable_predictions)
 def run_evaluation(labeled, predictions):
     merged = merge_predictions(labeled, predictions)
     versions = list(dict.fromkeys(merged["version"]))
@@ -346,11 +397,14 @@ def run_evaluation(labeled, predictions):
         "confusions": confusion_matrices(merged),
         "versions": compare_versions(merged),
         "models": pd.concat([compare_models(merged, v) for v in versions], ignore_index=True),
+        "readable": readable_predictions(merged),
     }
 
 
 # Salva in out_dir (default data/results/) i risultati di run_evaluation():
 #   metriche.csv, mcnemar_versioni.csv, mcnemar_modelli.csv, confusioni.csv  (tabelle)
+#   predizioni_leggibili.csv   commento per commento, con testo ed etichette (si apre
+#                              con Excel o Numbers; contiene il testo dei commenti)
 #   macro_f1.png, matrici_confusione.png                                     (grafici)
 # Il grafico delle barre riguarda tutti i commenti. I file sovrascrivono quelli precedenti.
 def save_results(results, out_dir=RESULTS_DIR):
@@ -360,6 +414,7 @@ def save_results(results, out_dir=RESULTS_DIR):
     results["metrics"].to_csv(out / "metriche.csv", index=False)
     results["versions"].to_csv(out / "mcnemar_versioni.csv", index=False)
     results["models"].to_csv(out / "mcnemar_modelli.csv", index=False)
+    results["readable"].to_csv(out / "predizioni_leggibili.csv", index=False, encoding="utf-8-sig")
 
     confusion_rows = []
     for (model, version), matrix in results["confusions"].items():
@@ -380,62 +435,124 @@ def save_results(results, out_dir=RESULTS_DIR):
     print(f"\nRisultati salvati in {out}")
 
 
-# Stampa a video il rapporto completo: riassunto dei commenti, metriche per sottoinsieme,
-# McNemar tra versioni e tra modelli, e (se n_errors > 0) esempi di commenti sbagliati.
-def _print_report(results, n_errors=0):
+# ---------------------------------------------------------------------
+# COLORI NELLA STAMPA (solo nel terminale)
+# ---------------------------------------------------------------------
+LABEL_COLORS = {"positivo": 32, "negativo": 31}            # verde e rosso
+MODEL_COLORS = [36, 35, 33, 34, 96, 95, 93, 94]            # ciano, magenta, giallo, blu (poi le versioni chiare)
+
+
+# Colora un testo gia' formattato (tabelle comprese) con i codici ANSI del terminale:
+#   - ogni NOME DI MODELLO ha un suo colore (il primo ciano, il secondo magenta, il
+#     terzo giallo, il quarto blu...), in base all'ordine in `models`;
+#   - la parola "positivo" diventa verde e "negativo" rosso (anche dentro a nomi di colonna
+#     come f1_positivo); "neutro" resta senza colore.
+# Si colorano solo queste parole, il resto del testo non cambia. I codici vengono aggiunti
+# DOPO aver formattato le tabelle, quindi le colonne restano allineate. Con
+# enabled=False restituisce il testo identico (serve quando l'output va su file).
+def colorize(text, models, enabled=True):
+    if not enabled:
+        return text
+
+    colors = {name: MODEL_COLORS[i % len(MODEL_COLORS)] for i, name in enumerate(models)}
+    parts = []
+    if models:
+        names = "|".join(re.escape(name) for name in sorted(models, key=len, reverse=True))
+        parts.append(rf"(?<![A-Za-z0-9_])(?P<model>{names})(?![A-Za-z0-9_])")
+    parts.append(r"(?<![A-Za-z])(?P<label>positivo|negativo)(?![A-Za-z])")
+
+    def paint(match):
+        word = match.group(0)
+        code = colors[word] if match.lastgroup == "model" else LABEL_COLORS[word]
+        return f"\033[{code}m{word}\033[0m"
+
+    return re.sub("|".join(parts), paint, text)
+
+
+# True se conviene usare i colori: solo se l'output va su un terminale (non su un file),
+# se non e' stato chiesto --no-color e se non e' impostata la variabile NO_COLOR.
+def _use_color(no_color):
+    return not no_color and sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+# Stampa a video il rapporto completo: riassunto dei commenti, metriche per sottoinsieme
+# e McNemar tra versioni e tra modelli. Non stampa gli errori (vedi _print_errors).
+# Con color=True colora i nomi dei modelli e le parole positivo/negativo (vedi colorize).
+def _print_report(results, color=False):
     merged = results["merged"]
+    models = list(dict.fromkeys(merged["model"]))
+
+    def emit(text=""):
+        print(colorize(text, models, color))
+
     comments = merged.drop_duplicates("comment_id")
     counts = comments["label_true"].value_counts()
-    print("Commenti valutati: {} | {} | con emoji: {}".format(
+    emit("Commenti valutati: {} | {} | con emoji: {}".format(
         len(comments),
         ", ".join(f"{label}: {counts.get(label, 0)}" for label in LABELS),
         int(comments["has_emoji"].sum())))
+    if "set" in comments.columns:
+        emit("Set di etichette: " + ", ".join(f"{name} ({n})" for name, n in comments["set"].value_counts().sort_index().items()))
 
     for subset, table in results["metrics"].groupby("subset", sort=False):
         n_comments = int(table["n"].max())
-        print(f"\n== Metriche: {subset} (n = {n_comments}) ==")
+        emit(f"\n== Metriche: {subset} (n = {n_comments}) ==")
         if n_comments < MIN_RELIABLE:
-            print(f"   attenzione: meno di {MIN_RELIABLE} commenti, risultati poco affidabili")
-        print(table.drop(columns="subset").round(3).to_string(index=False))
+            emit(f"   attenzione: meno di {MIN_RELIABLE} commenti, risultati poco affidabili")
+        emit(table.drop(columns="subset").round(3).to_string(index=False))
 
     no_neutral = [m for m, g in merged.groupby("model", sort=False) if not (g["label_pred"] == "neutro").any()]
     if no_neutral and (comments["label_true"] == "neutro").any():
-        print(f"\nNota: {', '.join(no_neutral)} non predice mai 'neutro': per un confronto equo "
-              f"guarda il sottoinsieme 'senza_neutro'.")
+        emit(f"\nNota: {', '.join(no_neutral)} non predice mai 'neutro': per un confronto equo "
+             f"guarda il sottoinsieme 'senza_neutro'.")
 
     if not results["versions"].empty:
-        print("\n== Emoji grezze o tradotte? McNemar per ogni modello (p < 0.05: differenza probabilmente reale) ==")
-        print(results["versions"].round(3).to_string(index=False))
+        emit("\n== Emoji grezze o tradotte? McNemar per ogni modello (p < 0.05: differenza probabilmente reale) ==")
+        emit(results["versions"].round(3).to_string(index=False))
 
     if not results["models"].empty:
-        print("\n== Modelli a confronto, due a due (guarda p_bonferroni) ==")
-        print(results["models"].round(3).to_string(index=False))
+        emit("\n== Modelli a confronto, due a due (guarda p_bonferroni) ==")
+        emit(results["models"].round(3).to_string(index=False))
 
-    if n_errors > 0:
-        for (model, version) in results["confusions"]:
-            examples = error_examples(merged, model, version, n=n_errors)
-            print(f"\n== Errori di {model} su {version} ({len(examples)} esempi) ==")
-            print(examples.to_string(index=False, max_colwidth=90) if len(examples) else "nessun errore")
+
+# Stampa SOLO gli errori, senza nessuna statistica: per ogni modello e versione del testo,
+# `n_errors` commenti sbagliati scelti a caso, con la tua etichetta, quella del modello e il
+# testo esatto ricevuto dal modello. Nel titolo c'e' il numero totale di errori di quel modello.
+def _print_errors(results, n_errors, color=False):
+    merged = results["merged"]
+    models = list(dict.fromkeys(merged["model"]))
+
+    for model, version in results["confusions"]:
+        wrong = int(((merged["model"] == model) & (merged["version"] == version) & ~merged["correct"]).sum())
+        examples = error_examples(merged, model, version, n=n_errors)
+        print(colorize(f"\n== Errori di {model} su {version}: {len(examples)} esempi su {wrong} errori ==", models, color))
+        body = examples.to_string(index=False, max_colwidth=90) if len(examples) else "nessun errore"
+        print(colorize(body, models, color))
 
 
 # Punto di ingresso: viene eseguito solo con `python src/evaluate.py ...`. Carica
-# dataset etichettato e predizioni, calcola tutto e stampa il rapporto. Se un file manca o
-# le etichette sono incomplete si ferma con un messaggio che dice cosa correggere.
+# dataset etichettato e predizioni, calcola tutto e stampa il rapporto (oppure, con
+# --errors, solo gli errori). Se un file manca o le etichette sono incomplete si ferma
+# con un messaggio che dice cosa correggere.
 def main():
     parser = argparse.ArgumentParser(
         description="Valuta i modelli: predizioni contro le etichette scritte a mano.",
         epilog="""esempi:
   python src/evaluate.py                    tutte le tabelle a video
-  python src/evaluate.py --errors 5         + 5 commenti sbagliati per ogni modello e versione
-  python src/evaluate.py --save             + CSV e grafici in data/results/""",
+  python src/evaluate.py --errors 5         SOLO 5 commenti sbagliati per ogni modello e versione
+  python src/evaluate.py --sets 00 01       solo con i set di etichette 00 e 01
+  python src/evaluate.py --save             tutte le tabelle + CSV e grafici in data/results/""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--predictions", default=str(PREDICTIONS_PATH),
                         help="CSV delle predizioni (default: %(default)s)")
-    parser.add_argument("--labels", default=None,
-                        help="CSV con le etichette scritte a mano (default: data/labeled/etichettati_a_mano.csv)")
+    parser.add_argument("--sets", nargs="+", default=None, metavar="NN",
+                        help="set di etichette da usare (es. 00 01); se omesso, tutti")
     parser.add_argument("--errors", type=int, default=0, metavar="N",
-                        help="stampa N commenti sbagliati per ogni modello e versione (default 0 = nessuno)")
+                        help="stampa SOLO N commenti sbagliati per ogni modello e versione, "
+                             "senza le statistiche (default 0 = rapporto completo)")
+    parser.add_argument("--no-color", action="store_true",
+                        help="niente colori nella stampa (vengono usati solo se l'output e' un terminale)")
     parser.add_argument("--save", action="store_true",
                         help="salva tabelle (CSV) e grafici (PNG) in --out-dir")
     parser.add_argument("--out-dir", default=str(RESULTS_DIR),
@@ -443,13 +560,18 @@ def main():
     args = parser.parse_args()
 
     try:
-        labeled = load_labeled_dataset(args.labels)
+        labeled = load_labeled_dataset(args.sets)
         predictions = load_predictions(args.predictions)
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"Impossibile partire: {exc}")
 
     results = run_evaluation(labeled, predictions)
-    _print_report(results, args.errors)
+    color = _use_color(args.no_color)
+
+    if args.errors > 0:
+        _print_errors(results, args.errors, color)
+    else:
+        _print_report(results, color)
 
     if args.save:
         import matplotlib
