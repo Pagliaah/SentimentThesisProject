@@ -18,6 +18,7 @@
 #     python src/models.py f x                   prova rapida con solo feel_it e xlmr_twitter
 #     python src/models.py --text "Bravo!"       prova rapida con una frase tua
 #     python src/models.py --dataset             tutti i modelli sul dataset etichettato -> CSV
+#     python src/models.py --dataset --sets 00   come sopra, ma solo con il set di etichette 00
 # La prova rapida NON crea nessun file. Tutte le opzioni: python src/models.py --help
 # =====================================================================
 
@@ -327,12 +328,14 @@ def _smoke_test(models: list[SentimentModel], texts: list[str]) -> None:
 # Esegue i modelli scelti sul dataset vero, con le due versioni del testo, e salva le
 # predizioni in out_path (stesso risultato di run_all dal notebook). Passi:
 #   1. legge i commenti di data/raw/ e li prepara (prepare_comments);
-#   2. li unisce alle etichette di data/labeled/etichettati_a_mano.csv (attach_labels):
-#      si usano solo i commenti che hai etichettato, perche' sono gli unici valutabili;
-#   3. lancia run_all(), che salva il CSV dopo ogni modello.
-# Se mancano i CSV o le etichette sono incomplete si ferma con il messaggio di errore
-# di preprocessing, che indica le righe da correggere.
-def _run_dataset(models: list[SentimentModel], out_path: Path | str) -> None:
+#   2. li unisce alle etichette dei set in data/labeled/ (attach_labels): `sets` sono i
+#      numeri dei set da usare (es. ["00", "01"]); se omesso, TUTTI i set. Si usano solo
+#      i commenti che hai etichettato, perche' sono gli unici valutabili;
+#   3. lancia run_all(), che salva il CSV dopo ogni modello (e lo sovrascrive: le
+#      predizioni vengono ricalcolate per tutti i commenti dei set scelti).
+# Se mancano i CSV o i set, o le etichette sono incomplete, si ferma con il messaggio di
+# errore di preprocessing, che indica file e righe da correggere.
+def _run_dataset(models: list[SentimentModel], out_path: Path | str, sets: list[str] | None = None) -> None:
     try:
         import preprocessing as pp            # lanciato come: python src/models.py
     except ImportError:
@@ -340,11 +343,13 @@ def _run_dataset(models: list[SentimentModel], out_path: Path | str) -> None:
 
     try:
         dataset, _ = pp.prepare_comments(pp.load_raw_comments())
-        labeled = pp.attach_labels(dataset, pp.TO_LABEL_FILE)
+        label_files = pp.resolve_label_sets(sets)
+        labeled = pp.attach_labels(dataset, label_files)
     except (FileNotFoundError, ValueError) as exc:
         raise SystemExit(f"Impossibile partire: {exc}")
 
-    print(f"Commenti etichettati: {len(labeled)} | modelli: {', '.join(m.name for m in models)}")
+    print(f"Set di etichette: {', '.join(sorted(labeled['set'].unique()))} | "
+          f"commenti etichettati: {len(labeled)} | modelli: {', '.join(m.name for m in models)}")
     preds = run_all(labeled, models=models, out_path=out_path)
     if preds.empty:
         raise SystemExit("Nessuna predizione prodotta: tutti i modelli hanno dato errore.")
@@ -369,7 +374,9 @@ esempi:
   python src/models.py f                       prova rapida con il solo feel_it
   python src/models.py f x --text "Bravo!"     una tua frase, solo feel_it e xlmr_twitter
   python src/models.py --dataset               tutti i modelli sul dataset -> CSV
-  python src/models.py n --dataset             solo nlptown_stelle sul dataset -> CSV""",
+  python src/models.py n --dataset             solo nlptown_stelle sul dataset -> CSV
+  python src/models.py --dataset --sets 00 01  solo i set di etichette 00 e 01
+  (scrivi le iniziali dei modelli PRIMA delle opzioni)""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("models", nargs="*",
@@ -379,6 +386,8 @@ esempi:
     parser.add_argument("--dataset", action="store_true",
                         help="esegue i modelli sui commenti etichettati (entrambe le versioni del "
                              "testo) e salva le predizioni su CSV")
+    parser.add_argument("--sets", nargs="+", default=None, metavar="NN",
+                        help="set di etichette da usare con --dataset (es. 00 01); se omesso, tutti")
     parser.add_argument("--out", default=str(PREDICTIONS_PATH),
                         help="dove salvare le predizioni con --dataset (default: %(default)s)")
     parser.add_argument("--neutral-threshold", type=float, default=None, metavar="SOGLIA",
@@ -388,11 +397,13 @@ esempi:
 
     if args.dataset and args.text:
         parser.error("--text e --dataset non si usano insieme")
+    if args.sets and not args.dataset:
+        parser.error("--sets si usa solo insieme a --dataset")
 
     models = select_models(build_models(neutral_threshold=args.neutral_threshold), args.models)
 
     if args.dataset:
-        _run_dataset(models, args.out)
+        _run_dataset(models, args.out, args.sets)
     else:
         _smoke_test(models, args.text or ESEMPI)
 
